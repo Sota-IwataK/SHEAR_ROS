@@ -1,0 +1,6 @@
+string node_name
+int32 node_id
+---
+float64 success_probability
+---
+float64 success_probability

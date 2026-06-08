@@ -1,0 +1,201 @@
+<root main_tree_to_execute="MainTree">
+
+  <BehaviorTree ID="Navigation">
+      <RecoveryNode number_of_retries="6" name="NavigateRecovery">
+      <PipelineSequence name="NavigateWithReplanning">
+        <RateController hz="20.0">
+          <RecoveryNode number_of_retries="1" name="ComputePathToPose">
+            <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+            <ReactiveFallback name="ComputePathToPoseRecoveryFallback">
+              <GoalUpdated/>
+              <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
+            </ReactiveFallback>
+          </RecoveryNode>
+        </RateController>
+        <RecoveryNode number_of_retries="1" name="FollowPath">
+          <FollowPath path="{path}" controller_id="FollowPath"/>
+          <ReactiveFallback name="FollowPathRecoveryFallback">
+            <GoalUpdated/>
+            <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap"/>
+          </ReactiveFallback>
+        </RecoveryNode>
+      </PipelineSequence>
+      <ReactiveFallback name="RecoveryFallback">
+        <GoalUpdated/>
+        <RoundRobin name="RecoveryActions">
+          <Sequence name="ClearingActions">
+            <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
+            <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
+          </Sequence>
+          <Spin spin_dist="1.57"/>
+          <Wait wait_duration="5"/>
+          <BackUp backup_dist="0.15" backup_speed="0.025"/>
+        </RoundRobin>
+      </ReactiveFallback>
+    </RecoveryNode>
+  </BehaviorTree>
+
+ <!-- <BehaviorTree ID="MainTree">
+    <SequenceStar name="root">
+      <CalculateGoal input_position="0.4;0.0" output_msg="{goal}"/>
+      <ReactiveFallback name="test">
+        <GoalReached global_frame="map" robot_base_frame="base_link" goal= "{goal}"/>
+        <SubTree ID="Navigation" node="node" server_timeout="server_timeout" bt_loop_duration="bt_loop_duration" goal="goal"/>
+      </ReactiveFallback>
+      <TaskClear/>
+    </SequenceStar>
+  </BehaviorTree> -->
+
+<!-- <BehaviorTree ID="MainTree">
+  <SequenceStar name="root">
+    <CalculateGoal input_position="0.0;0.0" output_msg="{goal}"/>
+    <ReactiveFallback name="test">
+      <GoalReached global_frame="map" robot_base_frame="base_link" goal="{goal}"/>
+      <SubTree ID="Navigation"
+        node="{node}"
+        goal="{goal}"
+        bt_loop_duration="{bt_loop_duration}"
+        server_timeout="{server_timeout}"
+        wait_for_service_timeout="{wait_for_service_timeout}"/>
+      <SubTreePlus ID="Navigation" __autoremap="true"
+            node="{node}" goal="{goal}"
+            bt_loop_duration="{bt_loop_duration}"
+            server_timeout="{server_timeout}"
+            wait_for_service_timeout="{wait_for_service_timeout}"/>
+    </ReactiveFallback>
+
+    <TaskClear/>
+  </SequenceStar>
+</BehaviorTree> -->
+
+
+
+<!-- <BehaviorTree ID="MainTree">
+    <SequenceStar name="root">
+      <CalculateGoal input_position="0.4;0.0" output_msg="{goal}"/>
+      <ReactiveFallback name="test">
+      <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
+      <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+      <FollowPath path="{path}" controller_id="FollowPath"/>
+      <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+        <GoalReached global_frame="map" robot_base_frame="base_link" goal= "{goal}"/>
+        <SubTree ID="Navigation" node="node" server_timeout="server_timeout" bt_loop_duration="bt_loop_duration" goal="goal"/>
+        <SubTree ID="Navigation"
+         node="{node}"
+         server_timeout="{server_timeout}"
+         bt_loop_duration="{bt_loop_duration}"
+         goal="{goal}"/>
+      </ReactiveFallback>
+      <TaskClear/>
+    </SequenceStar>
+  </BehaviorTree> -->
+
+  <!-- <BehaviorTree ID="Approach">
+    <Sequence>
+      <SetParam node_name="planner_server" param_name="GridBased.tolerance" double_value="{position_tolerance}"/>
+      <SetParam node_name="controller_server" param_name="goal_checker.xy_goal_tolerance" double_value="{position_tolerance}"/>
+      <SetParam node_name="planner_server" param_name="GridBased.use_final_approach_orientation" bool_value="{position_only}"/>
+      <PipelineSequence name="NavigateWithReplanning">
+        <RateController hz="1.0">
+          <RecoveryNode number_of_retries="1" name="RecoveryComputePathToPose">
+            <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+            <ReactiveFallback name="ComputePathToPoseRecoveryFallback">
+              <GoalUpdated/>
+              <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
+            </ReactiveFallback>
+          </RecoveryNode>
+        </RateController>"geometry_msgs::msg::PoseStamped"
+      <SetParam node_name="planner_server" param_name="GridBased.use_final_approach_orientation" bool_value="false"/>
+    </Sequence>
+  </BehaviorTree>  -->
+
+  <!-- <BehaviorTree ID="MainTree">
+    <SequenceStar name="root">
+        <SearchBtl posi_x = "posi_x" posi_y = "posi_y"/>
+        <CalculateObj  pose_obj="{pose_obj}"/>
+        <PickAmir action_name="pick" x = "{btl_x}" y = "{btl_y}" z = "0.42" server_timeout="{server_timeout}"/>
+    </SequenceStar>
+  </BehaviorTree> -->
+
+
+
+ <BehaviorTree ID="MainTree">
+    <SequenceStar name="root">
+      <CalculateObj  pose_obj="{pose_obj}"/>
+      <PickAmir action_name="pick" pose_obj="{pose_obj}" server_timeout="{server_timeout}"/>
+      <CalculatePlacePosi x = "0.01" y = "-0.40" z = "0.39" pose_obj="{pose_obj}"/>
+      <PlaceAmir action_name="place" pose_obj="{pose_obj}" server_timeout="{server_timeout}"/>
+      <!-- <SearchAmir action_name ="search" server_timeout="{server_timeout}"/> -->
+      <!-- <Delay delay_msec="2000">
+        <CalculateObj  pose_obj="{pose_obj}"/>
+      </Delay>  
+      <PickAmir action_name="pick" pose_obj="{pose_obj}" server_timeout="{server_timeout}"/>
+      <CalculatePlacePosi x = "0.01" y = "-0.40" z = "0.39" pose_obj="{pose_obj}"/>
+      <PlaceAmir action_name="place" pose_obj="{pose_obj}" server_timeout="{server_timeout}"/>
+      <SearchAmir action_name ="search" server_timeout="{server_timeout}"/> -->
+    </SequenceStar>
+  </BehaviorTree>
+
+
+  <!-- <BehaviorTree ID="MainTree">
+    <SequenceStar name="root">
+        <CheckGrasp/>
+        <CalculateBtl btl_x ="{btl_x}" btl_y = "{btl_y}"/>
+          <Delay delay_msec="2000">
+            <PickAmir action_name="pick" x = "{btl_x}" y = "{btl_y}" z = "0.42" server_timeout="{server_timeout}"/>
+          </Delay>  
+        <PickAmir action_name="pick" x = "0.57" y = "-0.08" z = "0.42" server_timeout="{server_timeout}"/>
+        <Fallback>
+          <SearchBtl posi_x = "{posi_x}" posi_y = "{posi_y}"/>
+          <Delay delay_msec="2000">
+           <MoveMeca action_name="amir/move_meca" posi_x = "{posi_x}" posi_y = "{posi_y}" server_timeout="{server_timeout}"/>
+           <MoveMeca action_name="amir/move_meca" posi_x = "0" posi_y = "0" server_timeout="{server_timeout}"/>
+          </Delay>
+        </Fallback>
+        <Sequence>
+          <CheckGrasp/>
+          <PlaceAmir action_name="place" x = "0.50" y = "0.01" z = "0.45" server_timeout="{server_timeout}"/>        
+        </Sequence>
+    </SequenceStar>
+  </BehaviorTree> -->
+
+  <!-- <BehaviorTree ID="MainTree">
+    <SequenceStar name="root">
+        <Sequence>
+          <CheckGrasp/>
+          <CalculateBtl btl_x ="{btl_x}" btl_y = "{btl_y}"/>
+          <PickAmir action_name="pick" x = "{btl_x}" y = "{btl_y}" z = "0.42" server_timeout="{server_timeout}"/>
+        </Sequence>
+        <Delay delay_msec="2000">
+          <MoveMeca action_name="amir/move_meca" posi_x = "0.0" posi_y = "1.5" server_timeout="{server_timeout}"/>
+        </Delay> -->
+          <!-- <SearchBtl posi_x = "posi_x" posi_y = "posi_y"/> -->
+        <!-- <CheckVel/> -->
+        <!-- <SearchBtl posi_x = "posi_x" posi_y = "posi_y"/> -->
+        <!-- <MoveMeca action_name="amir/move_meca" posi_x = "1.0" posi_y = "1.0" server_timeout="{server_timeout}"/> -->
+        <!-- <CalculateBtl btl_x ="{btl_x}" btl_y = "{btl_y}"/> -->
+        <!-- <PickAmir action_name="pick" x = "0.01" y = "-0.6" z = "0.4" server_timeout="{server_timeout}"/> -->
+        <!-- <PickAmir action_name="pick" x = "{btl_x}" y = "{btl_y}" z = "0.42" server_timeout="{server_timeout}"/> -->
+        <!-- <CheckGrasp/> -->
+        <!-- <Sequence>
+          <CheckOdom/>
+          <PlaceAmir action_name="place" x = "0.45" y = "-0.40" z = "0.40" server_timeout="{server_timeout}"/>        
+        </Sequence> -->
+    <!-- </SequenceStar>
+  </BehaviorTree> -->
+
+
+
+  <!-- <BehaviorTree ID="MainTree">
+    <SequenceStar name="root">
+      <CalculateGoal input_position="4.0;0.0" output_msg="{goal}"/>
+      <ReactiveFallback name="test">
+        <GoalReached global_frame="map" robot_base_frame="base_link" goal= "{goal}"/>
+        <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+      </ReactiveFallback>
+      <FollowPath path="{path}" controller_id="FollowPath"/>
+      <TaskClear/>
+    </SequenceStar>
+  </BehaviorTree> -->
+
+</root>

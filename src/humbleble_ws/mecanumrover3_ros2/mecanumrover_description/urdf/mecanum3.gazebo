@@ -1,0 +1,78 @@
+<?xml version="1.0"?>
+<robot name="mecanum3" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- Ignition Gazebo gz_ros2_control plugin.
+       <ros><remapping> doesn't reach controller_manager, so
+       /rover_twist → /mecanum_drive_controller/cmd_vel relay is handled
+       by rover_twist_relay_ign node in amir_gazebo/gazebo_bringup.launch.py. -->
+  <gazebo>
+    <plugin filename="gz_ros2_control-system"
+            name="gz_ros2_control::GazeboSimROS2ControlPlugin">
+      <parameters>$(find mecanumrover_description)/params/controllers.yaml</parameters>
+      <ros>
+        <remapping>/mecanum_drive_controller/odometry:=/odom</remapping>
+      </ros>
+    </plugin>
+  </gazebo>
+
+
+  <!-- Barrel roller friction (Ignition Gazebo style).
+       Ignition requires full <collision><surface> hierarchy.
+       mu:  high perpendicular to roller axis → resists lateral sliding.
+       mu2: lower along roller axis → allows free rolling (mecanum lateral motion).
+       slip1/slip2: small slip prevents jitter at rest. -->
+  <xacro:macro name="ign_barrel_friction" params="linkname">
+    <gazebo reference="${linkname}">
+      <collision>
+        <surface>
+          <friction>
+            <ode>
+              <mu>1.0</mu>
+              <!-- <mu2>0.6</mu2> -->
+              <mu2>0.0</mu2>
+              <!-- <slip1>0.1</slip1>
+              <slip2>0.1</slip2> -->
+              <slip1>0.0</slip1>
+              <slip2>0.0</slip2>
+            </ode>
+          </friction>
+          <contact>
+            <ode>
+              <kp>1e6</kp>
+              <kd>100.0</kd>
+              <!-- <min_depth>0.0001</min_depth> -->
+              <min_depth>0.005</min_depth>
+              <max_vel>0.1</max_vel>
+            </ode>
+          </contact>
+        </surface>
+      </collision>
+    </gazebo>
+  </xacro:macro>
+
+  <xacro:macro name="ign_barrel_group_friction" params="prefix">
+    <xacro:ign_barrel_friction linkname="${prefix}_0_link"  />
+    <xacro:ign_barrel_friction linkname="${prefix}_1_link"  />
+    <xacro:ign_barrel_friction linkname="${prefix}_2_link"  />
+    <xacro:ign_barrel_friction linkname="${prefix}_3_link"  />
+    <xacro:ign_barrel_friction linkname="${prefix}_4_link"  />
+    <xacro:ign_barrel_friction linkname="${prefix}_5_link"  />
+    <xacro:ign_barrel_friction linkname="${prefix}_6_link"  />
+    <xacro:ign_barrel_friction linkname="${prefix}_7_link"  />
+    <xacro:ign_barrel_friction linkname="${prefix}_8_link"  />
+    <xacro:ign_barrel_friction linkname="${prefix}_9_link"  />
+    <xacro:ign_barrel_friction linkname="${prefix}_10_link" />
+    <xacro:ign_barrel_friction linkname="${prefix}_11_link" />
+    <xacro:ign_barrel_friction linkname="${prefix}_12_link" />
+    <xacro:ign_barrel_friction linkname="${prefix}_13_link" />
+    <xacro:ign_barrel_friction linkname="${prefix}_14_link" />
+  </xacro:macro>
+
+
+  <!-- Barrel friction for all 4 mecanum wheels (15 rollers × 4 wheels = 60 entries) -->
+  <xacro:ign_barrel_group_friction prefix="front_left_barrel"/>
+  <xacro:ign_barrel_group_friction prefix="front_right_barrel"/>
+  <xacro:ign_barrel_group_friction prefix="back_left_barrel"/>
+  <xacro:ign_barrel_group_friction prefix="back_right_barrel"/>
+
+</robot>

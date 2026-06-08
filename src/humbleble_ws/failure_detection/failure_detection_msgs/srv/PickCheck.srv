@@ -1,0 +1,6 @@
+std_msgs/Bool grasp
+std_msgs/Bool drop
+std_msgs/Float64 angle_offset   #   把持直交角度からのオフセット
+geometry_msgs/Point target_position   #   目標位置
+---
+string error_strings

@@ -1,0 +1,4 @@
+global_parameter_server:
+  ros__parameters:
+    robot_list: 
+      - "Test2"
