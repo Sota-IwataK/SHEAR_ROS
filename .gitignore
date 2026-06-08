@@ -1,0 +1,35 @@
+# ROS 2 generated files
+build/
+install/
+log/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# colcon / test
+.colcon/
+coverage/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Large runtime data
+*.bag
+*.db3
+*.mcap
+
+# Unity artifacts if accidentally copied
+Library/
+Temp/
+Obj/
+Build/
+Builds/
+Logs/
+UserSettings/

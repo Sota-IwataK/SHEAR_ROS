@@ -1,0 +1,560 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Amir用軌道制御ノード（ROS2 Humble）
+YouBotのyoubot_real_trajectory_node_FMS.pyをROS2/Amirに移植
+"""
+
+import copy
+import math
+import numpy as np
+from enum import Enum
+
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import PoseStamped
+from std_msgs.msg import Float32MultiArray, String
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from builtin_interfaces.msg import Duration
+
+# ================== 設定 / 定数 ====================
+
+# Amirのジョイント名（xacroに合わせる）
+JOINT_NAMES = ['Joint_1', 'Joint_2', 'Joint_3', 'Joint_4', 'Joint_5']
+
+# Amirのリンク長（等価3リンク）[m]
+# Joint_3〜Joint_5 + tcp を3リンクに等価変換
+DEFAULT_L = [0.31, 0.31, 0.1525]
+
+# 把持向けyawロック
+YAW_LOCK_DEG = 90.0
+
+# IK関連
+SIGMA_MIN_THR = 0.03
+COND_MAX_THR  = 60.0
+ERR_THRESH    = 0.01
+
+# ヌル空間関連
+W_MANI  = 1.0
+W_LIMIT = 0.3
+K_NULL  = 0.02
+
+# Amir関節リミット（等価3リンク部分：Joint_3,4,5）
+JOINT_LIMITS = [
+    (-2.792527, 0.0),        # Joint_3: -160°〜0°
+    (-2.094395, 1.308997),   # Joint_4: -120°〜75°
+    (-2.75762,  2.75762),    # Joint_5: ±158°
+]
+
+# プレグラスプ関連
+PREGRASP_OFFSET = 0.06
+D_IN   = 0.18
+D_OUT  = 0.22
+SIG_K  = 40.0
+BETA_SMOOTH = 0.2
+
+# FSMパラメータ
+class Phase(Enum):
+    TRACK    = 0
+    BACKOFF  = 1
+    REALIGN  = 2
+    APPROACH = 3
+
+BACKOFF_D          = 0.05
+MARGIN_MIN_THR     = 0.08
+REALIGN_DT_MAX     = 0.6
+IMPROVE_H_MIN      = 0.08
+CD_SWITCH          = 0.5
+APPROACH_LOCK_BETA = True
+
+# ================== ユーティリティ ====================
+
+def DegToRad(th): return (np.pi / 180.0) * th
+def RadToDeg(th): return (180.0 / np.pi) * th
+
+def angle_wrap(a):
+    return (a + math.pi) % (2 * math.pi) - math.pi
+
+def Theta0(x, y):
+    if x == 0 and y == 0:
+        return 0.0
+    return math.atan2(y, x)
+
+# ---- 運動学（等価3リンク）----
+def fk(L, th0, th1, th2):
+    r = (L[0]*math.sin(th0)
+       + L[1]*math.sin(th0+th1)
+       + L[2]*math.sin(th0+th1+th2))
+    z = (L[0]*math.cos(th0)
+       + L[1]*math.cos(th0+th1)
+       + L[2]*math.cos(th0+th1+th2))
+    phi = th0 + th1 + th2
+    return [r, z, phi]
+
+def jacobian(L, th0, th1, th2):
+    r11 = (L[0]*math.cos(th0)
+         + L[1]*math.cos(th0+th1)
+         + L[2]*math.cos(th0+th1+th2))
+    r12 = (L[1]*math.cos(th0+th1)
+         + L[2]*math.cos(th0+th1+th2))
+    r13 =  L[2]*math.cos(th0+th1+th2)
+
+    r21 = -(L[0]*math.sin(th0)
+          + L[1]*math.sin(th0+th1)
+          + L[2]*math.sin(th0+th1+th2))
+    r22 = -(L[1]*math.sin(th0+th1)
+          + L[2]*math.sin(th0+th1+th2))
+    r23 = -L[2]*math.sin(th0+th1+th2)
+
+    J = np.array([
+        [r11, r12, r13],
+        [r21, r22, r23],
+        [1.0, 1.0, 1.0]
+    ], dtype=np.float64)
+    return J
+
+def dls_step(L, target, th, lam=1.0):
+    cur = fk(L, th[0], th[1], th[2])
+    err = np.array([
+        [target[0]-cur[0]],
+        [target[1]-cur[1]],
+        [angle_wrap(target[2]-cur[2])]
+    ], dtype=np.float64)
+    J = jacobian(L, th[0], th[1], th[2])
+    JJt = J @ J.T
+    J_pinv = J.T @ np.linalg.inv(JJt + lam*np.eye(3))
+    dth = (J_pinv @ err).reshape(3)
+    return dth, err, J
+
+def inversekinematics(L, pd, p0, lam):
+    p_fk = fk(L, p0[0], p0[1], p0[2])
+    v = np.array([
+        [0.1*(pd[0]-p_fk[0])],
+        [0.1*(pd[1]-p_fk[1])],
+        [0.1*angle_wrap(pd[2]-p_fk[2])]
+    ], dtype=np.float64)
+    J = jacobian(L, p0[0], p0[1], p0[2])
+    JT = J.T
+    dtheta = (np.linalg.pinv(JT@J + lam*np.eye(3)) @ JT) @ v
+    return 0.1 * dtheta
+
+def ik_converges(L, target, th0, max_iters=200):
+    th = th0.copy()
+    lam = 1.0
+    J = jacobian(L, th[0], th[1], th[2])
+    err = np.zeros((3, 1))
+    for _ in range(max_iters):
+        dth, err, J = dls_step(L, target, th, lam)
+        e = float(err.T @ err)
+        lam = e + 0.002
+        th += dth
+        if e < ERR_THRESH**2:
+            U, S, Vt = np.linalg.svd(J, full_matrices=False)
+            return True, e, S.min(), S.max()/S.min(), th
+    U, S, Vt = np.linalg.svd(J, full_matrices=False)
+    smin = S.min()
+    cond = S.max()/S.min() if smin > 1e-8 else float('inf')
+    return False, float(err.T @ err), smin, cond, th
+
+def manipulability(J):
+    det = np.linalg.det(J @ J.T)
+    if det <= 1e-12: return -1e6
+    return math.log(det)
+
+def limit_margin_cost(th, limits=JOINT_LIMITS, eps=1e-3):
+    s = 0.0
+    for i, (lo, hi) in enumerate(limits):
+        m = max(min(th[i]-lo, hi-th[i]), eps)
+        s += math.log(m)
+    return s
+
+def merit_function(th, L):
+    J = jacobian(L, th[0], th[1], th[2])
+    return W_MANI*manipulability(J) + W_LIMIT*limit_margin_cost(th)
+
+def finite_diff_grad(f, th, L, h=1e-3):
+    g = np.zeros(3, dtype=np.float64)
+    base = f(th, L)
+    for i in range(3):
+        th_p = th.copy()
+        th_p[i] += h
+        g[i] = (f(th_p, L) - base) / h
+    return g
+
+def nullspace_projector(J):
+    JJt = J @ J.T
+    J_pinv = J.T @ np.linalg.inv(JJt + 1e-6*np.eye(3))
+    return np.eye(3) - J_pinv @ J
+
+def cond_and_sigma(J):
+    U, S, Vt = np.linalg.svd(J, full_matrices=False)
+    smin = float(S.min())
+    cond = float(S.max()/S.min()) if S.min() > 1e-8 else float('inf')
+    return cond, smin
+
+def e_task_norm(th, target, L):
+    cur = fk(L, th[0], th[1], th[2])
+    dr = target[0]-cur[0]
+    dz = target[1]-cur[1]
+    dphi = angle_wrap(target[2]-cur[2])
+    return math.sqrt(dr*dr + dz*dz + dphi*dphi)
+
+def joint_margins(th, limits):
+    return [min(th[i]-lo, hi-th[i]) for i,(lo,hi) in enumerate(limits)]
+
+# ---- プレグラスプ ----
+def make_pregrasp_from_bottle(bxyz, approach_yaw_deg=YAW_LOCK_DEG,
+                               offset=PREGRASP_OFFSET):
+    bx, by, bz = bxyz
+    r = math.sqrt(bx*bx + by*by)
+    yaw = DegToRad(approach_yaw_deg)
+    r_pre = max(r - offset, 0.02)
+    return [r_pre, bz, yaw]
+
+_beta = 0.0
+_near = False
+
+def blend_weight(distance, d_in=D_IN, d_out=D_OUT,
+                 k=SIG_K, alpha=BETA_SMOOTH):
+    global _beta, _near
+    if _near:
+        if distance >= d_out: _near = False
+    else:
+        if distance <= d_in: _near = True
+    d0 = d_in if _near else d_out
+    b_inst = 1.0 / (1.0 + math.exp(k*(distance - d0)))
+    _beta = (1-alpha)*_beta + alpha*b_inst
+    return _beta
+
+def merit_pregrasp_aug(th, L, th_pre=None):
+    base = merit_function(th, L)
+    extra = 0.0
+    if th_pre is not None:
+        extra += 0.3 * (-np.sum((th - th_pre)**2))
+    return base + extra
+
+# ================== ROS2ノード ====================
+
+class AmirTrajectoryNode(Node):
+    def __init__(self):
+        super().__init__('amir_trajectory_node')
+
+        # パラメータ宣言
+        self.declare_parameter('L1', DEFAULT_L[0])
+        self.declare_parameter('L2', DEFAULT_L[1])
+        self.declare_parameter('L3', DEFAULT_L[2])
+        self.declare_parameter('th1_init', 0.1)
+        self.declare_parameter('th2_init', 0.2)
+        self.declare_parameter('th3_init', 0.3)
+        self.declare_parameter('alpha',  0.05)
+        self.declare_parameter('k_null', K_NULL)
+
+        # パラメータ取得
+        self.L = [
+            self.get_parameter('L1').value,
+            self.get_parameter('L2').value,
+            self.get_parameter('L3').value,
+        ]
+        p0 = [
+            self.get_parameter('th1_init').value,
+            self.get_parameter('th2_init').value,
+            self.get_parameter('th3_init').value,
+        ]
+        self.theta0 = p0[0]
+        self.theta1 = p0[1]
+        self.theta2 = p0[2]
+        self.alpha  = self.get_parameter('alpha').value
+        self.k_null = self.get_parameter('k_null').value
+
+        # 状態変数
+        self.palm_pose  = PoseStamped()
+        self.bottle_xyz = np.zeros(3, dtype=np.float64)
+
+        # FSM
+        self.phase          = Phase.TRACK
+        self.last_switch_t  = 0.0
+        self.realign_start_t = 0.0
+        self.H_baseline     = None
+        self.stand_rzp      = None
+
+        # Subscriber
+        self.create_subscription(
+            PoseStamped,
+            '/palm_pose',
+            self.palm_cb,
+            10)
+        self.create_subscription(
+            Float32MultiArray,
+            '/identified_bottle_pose',
+            self.bottle_cb,
+            10)
+
+        # Publisher
+        # JointTrajectory（ROS2標準、MoveIt2対応）
+        self.arm_pub = self.create_publisher(
+            JointTrajectory,
+            '/amir_arm_controller/joint_trajectory',
+            10)
+        self.metrics_pub = self.create_publisher(
+            Float32MultiArray,
+            '/amir_metrics',
+            20)
+        self.phase_pub = self.create_publisher(
+            String,
+            '/phase_name',
+            10)
+
+        # 30Hzタイマー
+        self.t0 = self.get_clock().now().nanoseconds * 1e-9
+        self.timer = self.create_timer(1.0/30.0, self.control_loop)
+        self.get_logger().info('Amir Trajectory Node started')
+
+    # ---- コールバック ----
+    def palm_cb(self, msg):
+        self.palm_pose = msg
+
+    def bottle_cb(self, msg):
+        if len(msg.data) >= 3:
+            self.bottle_xyz[0] = -float(msg.data[0])
+            self.bottle_xyz[1] = -float(msg.data[2])
+            self.bottle_xyz[2] =  float(msg.data[1])
+
+    # ---- Amirへのコマンド送信 ----
+    def publish_arm_command(self, joint_angles_5dof):
+        """
+        joint_angles_5dof: [J1, J2, J3, J4, J5] (rad)
+        JointTrajectoryとして送信
+        """
+        msg = JointTrajectory()
+        msg.joint_names = JOINT_NAMES
+
+        point = JointTrajectoryPoint()
+        point.positions = [float(a) for a in joint_angles_5dof]
+        point.time_from_start = Duration(sec=0, nanosec=100_000_000)  # 0.1秒
+
+        msg.points = [point]
+        self.arm_pub.publish(msg)
+
+    # ---- メイン制御ループ ----
+    def control_loop(self):
+        now = self.get_clock().now().nanoseconds * 1e-9 - self.t0
+
+        # 手ポーズ取得
+        px = self.palm_pose.pose.position.x
+        py = self.palm_pose.pose.position.y
+        pz = self.palm_pose.pose.position.z
+
+        if px == 0 and py == 0 and pz == 0:
+            pose_holo = [0.0, 0.0, 0.2]
+        else:
+            pose_holo = [px, py, pz]
+
+        r_palm  = math.sqrt(pose_holo[0]**2 + pose_holo[1]**2)
+        z_palm  = pose_holo[2]
+        phi_palm = DegToRad(YAW_LOCK_DEG)
+        palm_rzp = [r_palm, z_palm, phi_palm]
+
+        # プレグラスプ生成＆ブレンド
+        if np.linalg.norm(self.bottle_xyz) > 1e-6:
+            pre_rzp = make_pregrasp_from_bottle(self.bottle_xyz)
+            dist = math.sqrt(
+                (pose_holo[0]-self.bottle_xyz[0])**2 +
+                (pose_holo[1]-self.bottle_xyz[1])**2)
+            beta = blend_weight(dist)
+        else:
+            pre_rzp = palm_rzp
+            beta    = 0.0
+            dist    = -1.0
+
+        if (APPROACH_LOCK_BETA and
+            self.phase == Phase.APPROACH and
+            np.linalg.norm(self.bottle_xyz) > 1e-6):
+            beta = 1.0
+
+        target_rzp = [
+            (1-beta)*palm_rzp[0] + beta*pre_rzp[0],
+            (1-beta)*palm_rzp[1] + beta*pre_rzp[1],
+            (1-beta)*palm_rzp[2] + beta*pre_rzp[2],
+        ]
+
+        if self.phase == Phase.BACKOFF and self.stand_rzp is not None:
+            target_rzp = self.stand_rzp
+
+        # プレグラスプ関節θ_pre
+        th_pre = None
+        if np.linalg.norm(self.bottle_xyz) > 1e-6:
+            ok_pg, _, _, _, th_try = ik_converges(
+                self.L, pre_rzp,
+                np.array([self.theta0, self.theta1, self.theta2]))
+            if ok_pg:
+                th_pre = th_try
+
+        # DLS-IK
+        lam = 1.0
+        for _ in range(150):
+            cur = fk(self.L, self.theta0, self.theta1, self.theta2)
+            err = np.array([
+                [target_rzp[0]-cur[0]],
+                [target_rzp[1]-cur[1]]
+            ], dtype=np.float64)
+            e = float(err.T @ err)
+            lam = e + 0.002
+            dth = inversekinematics(
+                self.L, target_rzp,
+                [self.theta0, self.theta1, self.theta2], lam)
+            self.theta0 += float(self.alpha * dth[0, 0])
+            self.theta1 += float(self.alpha * dth[1, 0])
+            self.theta2 += float(self.alpha * dth[2, 0])
+            if e < 1e-6:
+                break
+
+        # ヌル空間最適化
+        th_vec = np.array([self.theta0, self.theta1, self.theta2])
+        J_now = jacobian(self.L, self.theta0, self.theta1, self.theta2)
+        cond_now, sigma_min_now = cond_and_sigma(J_now)
+        mani_now = manipulability(J_now)
+        m0, m1, m2 = joint_margins(th_vec, JOINT_LIMITS)
+        H_before = merit_pregrasp_aug(th_vec, self.L, th_pre)
+        e_before = e_task_norm(th_vec, target_rzp, self.L)
+
+        P = nullspace_projector(J_now)
+        gradH = finite_diff_grad(
+            lambda th, L_: merit_pregrasp_aug(th, L_, th_pre),
+            th_vec, self.L)
+        dth_null = self.k_null * (P @ gradH)
+        self.theta0 += float(dth_null[0])
+        self.theta1 += float(dth_null[1])
+        self.theta2 += float(dth_null[2])
+
+        # 関節リミットクリップ
+        self.theta0 = float(np.clip(self.theta0, *JOINT_LIMITS[0]))
+        self.theta1 = float(np.clip(self.theta1, *JOINT_LIMITS[1]))
+        self.theta2 = float(np.clip(self.theta2, *JOINT_LIMITS[2]))
+
+        th_vec_after = np.array([self.theta0, self.theta1, self.theta2])
+        H_after  = merit_pregrasp_aug(th_vec_after, self.L, th_pre)
+        dH_null  = H_after - H_before
+        e_after  = e_task_norm(th_vec_after, target_rzp, self.L)
+        Jdnull   = J_now @ dth_null.reshape(3, 1)
+        Jdnull_norm = float(np.linalg.norm(Jdnull))
+        dnull_norm  = float(np.linalg.norm(dth_null))
+        de_due_null = e_after - e_before
+
+        # FSM遷移
+        cooldown_ok = (now - self.last_switch_t) > CD_SWITCH
+        near = (np.linalg.norm(self.bottle_xyz) > 1e-6 and
+                dist >= 0.0 and dist <= D_IN + 0.03)
+        m_min = min(m0, m1, m2)
+        bad_posture = (sigma_min_now < SIGMA_MIN_THR or
+                       cond_now > COND_MAX_THR or
+                       m_min < MARGIN_MIN_THR)
+        Phase_name = self.phase.name
+
+        if self.phase == Phase.TRACK:
+            if cooldown_ok and near and bad_posture:
+                r_stand = pre_rzp[0] + BACKOFF_D
+                self.stand_rzp = [r_stand, pre_rzp[1], pre_rzp[2]]
+                self.last_switch_t = now
+                Phase_name = "BACKOFF"
+
+        elif self.phase == Phase.BACKOFF:
+            cur_rzp = fk(self.L, self.theta0, self.theta1, self.theta2)
+            err_bo = math.hypot(
+                self.stand_rzp[0]-cur_rzp[0],
+                self.stand_rzp[1]-cur_rzp[1])
+            if err_bo < 0.01:
+                self.phase = Phase.REALIGN
+                self.realign_start_t = now
+                self.H_baseline = H_after
+                self.last_switch_t = now
+                Phase_name = "REALIGN"
+
+        elif self.phase == Phase.REALIGN:
+            improved = ((H_after - self.H_baseline) > IMPROVE_H_MIN
+                        if self.H_baseline else False)
+            timeout  = (now - self.realign_start_t) > REALIGN_DT_MAX
+            criteria_ok = (sigma_min_now >= SIGMA_MIN_THR*1.2 and
+                           cond_now <= COND_MAX_THR*0.8 and
+                           m_min >= MARGIN_MIN_THR)
+            if cooldown_ok and (improved or timeout or criteria_ok):
+                self.phase = Phase.APPROACH
+                self.last_switch_t = now
+                Phase_name = "APPROACH"
+
+        elif self.phase == Phase.APPROACH:
+            cur_rzp = fk(self.L, self.theta0, self.theta1, self.theta2)
+            err_ap  = math.hypot(
+                target_rzp[0]-cur_rzp[0],
+                target_rzp[1]-cur_rzp[1])
+            if err_ap < 0.01:
+                self.phase = Phase.TRACK
+                self.last_switch_t = now
+                Phase_name = "TRACK"
+
+        # Amirの5DOF関節角に変換
+        # Joint_1：ベース旋回
+        theta_base = (DegToRad(169/2)
+                      - Theta0(pose_holo[1], pose_holo[0]))
+        theta_base = float(np.clip(
+            theta_base,
+            -2.96706, 2.96706))  # Joint_1リミット
+
+        # Joint_2：固定オフセット（YouBotのDegToRad(65)相当）
+        # Amirの関節構造に合わせて調整が必要
+        joint_2 = float(np.clip(
+            DegToRad(65) - self.theta0,
+            0.0, 2.356194))  # Joint_2リミット(0〜135°)
+
+        joint_3 = float(np.clip(
+            -DegToRad(146) - self.theta1,
+            -2.792527, 0.0))  # Joint_3リミット
+
+        joint_4 = float(np.clip(
+            DegToRad(102.5) - self.theta2,
+            -2.094395, 1.308997))  # Joint_4リミット
+
+        joint_5 = float(np.clip(
+            DegToRad(167.5),
+            -2.75762, 2.75762))  # Joint_5リミット
+
+        joint_angles = [
+            theta_base,  # Joint_1
+            joint_2,     # Joint_2
+            joint_3,     # Joint_3
+            joint_4,     # Joint_4
+            joint_5,     # Joint_5
+        ]
+
+        # Publish
+        self.publish_arm_command(joint_angles)
+
+        phase_msg = String()
+        phase_msg.data = Phase_name
+        self.phase_pub.publish(phase_msg)
+
+        metrics_msg = Float32MultiArray()
+        metrics_msg.data = [
+            float(now), float(dist), float(beta), float(e_after),
+            float(sigma_min_now), float(cond_now),
+            float(mani_now), float(m0), float(m1), float(m2),
+            float(H_after), float(dH_null),
+            float(Jdnull_norm), float(dnull_norm),
+            float(de_due_null), float(self.phase.value)
+        ]
+        self.metrics_pub.publish(metrics_msg)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = AmirTrajectoryNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
